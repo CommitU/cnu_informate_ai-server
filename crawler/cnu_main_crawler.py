@@ -3,9 +3,12 @@ import time
 import random
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+from typing import List, Dict
+
 
 class CnuMainCrawling:
-    def __init__(self, code, pages):
+    def __init__(self, code, pages, fields=None, category=None):
         self.base_url = "https://plus.cnu.ac.kr/_prog/_board/"
         self.params = {
             "code": code,
@@ -17,98 +20,139 @@ class CnuMainCrawling:
             "ntt_tag": "",
         }
         self.max_pages = pages
+        self.fields = fields or ["제목", "작성일", "조회수", "링크", "본문"]
+        self.category = category
 
     @staticmethod
     def delay():
-        sleep_time = random.uniform(1, 2.5)
-        time.sleep(sleep_time)
+        time.sleep(random.uniform(2, 5))  # 딜레이 시간 증가
 
     def fetch_page(self, page: int) -> str:
-        # 주어진 페이지의 HTML을 반환
         self.delay()
         headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/114.0.0.0 Safari/537.36"
+            )
         }
-
         self.params["GotoPage"] = page
-        res = requests.get(self.base_url, headers=headers, params=self.params)
-        res.encoding = 'utf-8'
-        res.raise_for_status()
-        return res.text
 
-    def parse_titles(self, html: str) -> list:
-        # HTML에서 게시글 제목 추출
+        # 재시도 로직 추가
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                res = requests.get(
+                    self.base_url,
+                    headers=headers,
+                    params=self.params,
+                    timeout=30  # 타임아웃 30초로 증가
+                )
+                res.encoding = 'utf-8'
+                res.raise_for_status()
+                return res.text
+            except requests.Timeout:
+                print(f"페이지 {page} 타임아웃 (시도 {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    time.sleep(5)  # 재시도 전 5초 대기
+                    continue
+            except requests.RequestException as e:
+                print(f"Error fetching page {page}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(3)
+                    continue
+
+        print(f"페이지 {page} 가져오기 실패 (모든 재시도 소진)")
+        return ""
+
+    def parse_page(self, html: str) -> List[Dict]:
+        if not html.strip():
+            return []
+
         soup = BeautifulSoup(html, "html.parser")
         titles = soup.find_all("td", class_="title")
-        return [title.text.strip() for title in titles]
-
-    def parse_hits(self, html: str) -> list:
-        # HTML에서 조회수 추출
-        soup = BeautifulSoup(html, "html.parser")
         hits = soup.find_all("td", class_="hits")
-        return [hit.text.strip() for hit in hits]
-
-    def parse_dates(self, html: str) -> list:
-        # HTML에서 날짜 추출
-        soup = BeautifulSoup(html, "html.parser")
         dates = soup.find_all("td", class_="date")
-        return [date.text.strip() for date in dates]
 
-    def parse_post_links(self, html: str) -> list:
-        # HTML에서 상세 페이지 링크 추출
-        soup = BeautifulSoup(html, "html.parser")
-        titles = soup.find_all("td", class_="title")
-        links = []
-        for title in titles:
-            a_tag = title.find("a")
-            if a_tag and 'href' in a_tag.attrs:
-                href = a_tag['href']
-                full_url = requests.compat.urljoin(self.base_url, href)
-                links.append(full_url)
-        return links
+        rows = []
+        for idx, title_td in enumerate(titles):
+            # 링크 추출
+            a_tag = title_td.find("a")
+            href = a_tag["href"] if a_tag and "href" in a_tag.attrs else ""
+            full_url = urljoin(self.base_url, href)
+
+            row = {}
+            if self.category is not None:
+                row["category"] = self.category
+            if "제목" in self.fields:
+                row["제목"] = title_td.get_text(strip=True)
+            if "조회수" in self.fields and idx < len(hits):
+                row["조회수"] = hits[idx].get_text(strip=True)
+            if "작성일" in self.fields and idx < len(dates):
+                row["작성일"] = dates[idx].get_text(strip=True)
+            if "링크" in self.fields:
+                row["링크"] = full_url
+
+            rows.append(row)
+        return rows
 
     def fetch_post_detail(self, url: str) -> str:
-        # 상세 페이지에서 게시글 본문을 추출
         self.delay()
-        res = requests.get(url)
-        res.encoding = 'utf-8'
-        res.raise_for_status()
-        soup = BeautifulSoup(res.text, "html.parser")
-        detail_div = soup.find("div", class_="board_viewDetail")
-        return detail_div.get_text(strip=True) if detail_div else ""
 
-    def crawl_all(self):
-        # 1페이지부터 max_pages까지 크롤링
+        # 재시도 로직 추가
+        max_retries = 2  # 본문은 2번만 재시도
+        for attempt in range(max_retries):
+            try:
+                res = requests.get(url, timeout=30)  # 타임아웃 30초로 증가
+                res.encoding = 'utf-8'
+                res.raise_for_status()
+                soup = BeautifulSoup(res.text, "html.parser")
+                detail_div = soup.find("div", class_="board_viewDetail")
+                return detail_div.get_text(strip=True) if detail_div else ""
+            except requests.Timeout:
+                print(f"본문 가져오기 타임아웃: {url} (시도 {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    time.sleep(10)  # 재시도 전 10초 대기
+                    continue
+            except requests.RequestException as e:
+                print(f"Error fetching post detail from {url}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+                    continue
+
+        print(f"본문 가져오기 실패: {url}")
+        return ""
+
+    def crawl_all(self) -> List[Dict]:
+        all_data = []
         for page in range(1, self.max_pages + 1):
-            all_data = []
-
+            print(f"페이지 {page}/{self.max_pages} 크롤링 중...")
             html = self.fetch_page(page)
-            titles = self.parse_titles(html)
-            hits = self.parse_hits(html)
-            dates = self.parse_dates(html)
-            links = self.parse_post_links(html)
+            parsed = self.parse_page(html)
 
-            for title, date, hit, link in zip(titles, dates, hits, links):
-                contents = self.fetch_post_detail(link)
-                all_data.append({
-                    "제목": title,
-                    "작성일": date,
-                    "조회수": hit,
-                    "링크": link,
-                    "본문": contents
-                })
+            # 본문 필드가 필요하면 순차 크롤링
+            if "본문" in self.fields:
+                for i, row in enumerate(parsed):
+                    print(f"  본문 {i + 1}/{len(parsed)} 가져오는 중...")
+                    link = row.get("링크", "")
+                    row["본문"] = self.fetch_post_detail(link) if link else ""
+
+            all_data.extend(parsed)
+            print(f"페이지 {page} 완료: {len(parsed)}개 데이터 수집")
+
         return all_data
 
-    def save_to_csv(self, data: list[dict], output_file: str = "cnu_board_data.csv"):
-        # 수집된 데이터를 CSV 파일로 저장
+    @staticmethod
+    def save_to_csv(data: List[Dict]):
+        # 수집된 데이터를 CSV 파일로 저장 (고정 파일명)
         if not data:
-            print("저장할 데이터가 없던데...?")
+            print("저장할 데이터가 없습니다.")
             return
 
-        with open(output_file, mode='w', newline='', encoding='utf-8-sig') as file:
+        filename = "cnu_board_data.csv"
+        with open(filename, mode='w', newline='', encoding='utf-8-sig') as file:
             writer = csv.DictWriter(file, fieldnames=data[0].keys())
             writer.writeheader()
-            for row in data:
-                writer.writerow(row)
+            writer.writerows(data)
 
-        print(f"{output_file}에 저장 완력되었습니다.ㅇ")
+        print(f"{filename}에 저장되었습니다.")
