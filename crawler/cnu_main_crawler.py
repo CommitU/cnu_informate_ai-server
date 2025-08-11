@@ -1,158 +1,129 @@
-import csv
 import time
 import random
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
-from typing import List, Dict
+from typing import Optional, Dict, List, Tuple
 
+BASE = "https://plus.cnu.ac.kr/_prog/_board/"
+PARAMS = {
+    "code": "sub07_0702",
+    "site_dvs_cd": "kr",
+    "menu_dvs_cd": "0702",
+    "skey": "",
+    "sval": "",
+    "site_dvs": "",
+    "ntt_tag": "",
+}
 
-class CnuMainCrawling:
-    def __init__(self, code, pages, fields=None, category=None):
-        self.base_url = "https://plus.cnu.ac.kr/_prog/_board/"
-        self.params = {
-            "code": code,
-            "site_dvs_cd": "kr",
-            "menu_dvs_cd": "0702",
-            "skey": "",
-            "sval": "",
-            "site_dvs": "",
-            "ntt_tag": "",
-        }
-        self.max_pages = pages
-        self.fields = fields or ["제목", "작성일", "조회수", "링크", "본문"]
-        self.category = category
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (CNU-InfoMate/0.1; +https://plus.cnu.ac.kr)"
+}
 
-    @staticmethod
-    def delay():
-        time.sleep(random.uniform(2, 5))  # 딜레이 시간 증가
+def delay() -> None:
+    """요청 간 랜덤 지연(차단 방지)"""
+    time.sleep(random.uniform(1.0, 2.5))
 
-    def fetch_page(self, page: int) -> str:
-        self.delay()
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/114.0.0.0 Safari/537.36"
-            )
-        }
-        self.params["GotoPage"] = page
+# ---------------------------
+# 재시도 유틸
+# ---------------------------
+RETRY_STATUS = {500, 502, 503, 504}  # 서버측 문제만 재시도
 
-        # 재시도 로직 추가
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                res = requests.get(
-                    self.base_url,
-                    headers=headers,
-                    params=self.params,
-                    timeout=30  # 타임아웃 30초로 증가
-                )
-                res.encoding = 'utf-8'
-                res.raise_for_status()
-                return res.text
-            except requests.Timeout:
-                print(f"페이지 {page} 타임아웃 (시도 {attempt + 1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    time.sleep(5)  # 재시도 전 5초 대기
-                    continue
-            except requests.RequestException as e:
-                print(f"Error fetching page {page}: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(3)
-                    continue
+def request_with_retry(
+    url: str,
+    params: Optional[Dict] = None,
+    timeout: int = 20,
+    max_retries: int = 3,
+    backoff_factor: float = 1.6,
+    headers: Optional[Dict] = None,
+) -> Optional[requests.Response]:
+    """
+    requests.get에 재시도(지수 백오프 + 지터)를 적용.
+    - 재시도 대상: 타임아웃/연결오류/5xx
+    - 4xx는 재시도하지 않음
+    실패 시 None 반환
+    """
+    headers = headers or DEFAULT_HEADERS
+    attempt = 0
+    while attempt <= max_retries:
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+            if resp.status_code in RETRY_STATUS:
+                # 5xx는 재시도
+                raise requests.HTTPError("retryable", response=resp)
+            return resp
+        except (requests.ConnectTimeout, requests.ReadTimeout):
+            pass  # 타임아웃 → 재시도
+        except (requests.ConnectionError, requests.ChunkedEncodingError, requests.HTTPError) as e:
+            # 4xx면 즉시 포기
+            if isinstance(e, requests.HTTPError) and getattr(e, "response", None) is not None:
+                if 400 <= e.response.status_code < 500:
+                    print("[SKIP 4xx] {} -> {}".format(url, e.response.status_code))
+                    return None
+        except Exception as e:
+            print("[ERROR] {} -> {}: {}".format(url, type(e).__name__, e))
+            return None
 
-        print(f"페이지 {page} 가져오기 실패 (모든 재시도 소진)")
-        return ""
+        if attempt == max_retries:
+            print("[GIVEUP] {} after {} retries".format(url, max_retries))
+            return None
 
-    def parse_page(self, html: str) -> List[Dict]:
-        if not html.strip():
-            return []
+        sleep_s = (backoff_factor ** attempt) + random.uniform(0, 0.3)
+        print("[RETRY {}/{}] waiting {:.2f}s for {}".format(attempt + 1, max_retries, sleep_s, url))
+        time.sleep(sleep_s)
+        attempt += 1
 
-        soup = BeautifulSoup(html, "html.parser")
-        titles = soup.find_all("td", class_="title")
-        hits = soup.find_all("td", class_="hits")
-        dates = soup.find_all("td", class_="date")
+    return None
 
-        rows = []
-        for idx, title_td in enumerate(titles):
-            # 링크 추출
-            a_tag = title_td.find("a")
-            href = a_tag["href"] if a_tag and "href" in a_tag.attrs else ""
-            full_url = urljoin(self.base_url, href)
+# ---------------------------
+# 목록/상세 크롤러
+# ---------------------------
+def fetch_page(page: int) -> Optional[str]:
+    """목록 페이지 HTML 반환(재시도 적용)"""
+    delay()
+    p = dict(PARAMS)
+    p["GotoPage"] = page
+    resp = request_with_retry(BASE, params=p, timeout=20, max_retries=3)
+    if not resp:
+        return None
+    resp.encoding = "utf-8"
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError:
+        print("[HTTP {}] list page {} -> skip".format(resp.status_code, page))
+        return None
+    return resp.text
 
-            row = {}
-            if self.category is not None:
-                row["category"] = self.category
-            if "제목" in self.fields:
-                row["제목"] = title_td.get_text(strip=True)
-            if "조회수" in self.fields and idx < len(hits):
-                row["조회수"] = hits[idx].get_text(strip=True)
-            if "작성일" in self.fields and idx < len(dates):
-                row["작성일"] = dates[idx].get_text(strip=True)
-            if "링크" in self.fields:
-                row["링크"] = full_url
+def parse_list(html: str) -> List[Tuple[str, str]]:
+    """목록 HTML에서 (제목, 상세링크) 추출"""
+    soup = BeautifulSoup(html, "html.parser")
+    anchors = soup.select("td.title a")
+    pairs: List[Tuple[str, str]] = []
+    for a in anchors:
+        href = a.get("href")
+        if not href:
+            continue
+        pairs.append((a.get_text(strip=True), urljoin(BASE, href)))
+    return pairs
 
-            rows.append(row)
-        return rows
+def fetch_detail(url: str) -> Tuple[str, Optional[str]]:
+    """
+    상세 페이지에서 (본문, 게시일) 추출 (재시도 적용)
+    게시일 파싱이 불안정하면 None 반환
+    """
+    delay()
+    resp = request_with_retry(url, timeout=20, max_retries=3)
+    if not resp:
+        return "", None
+    resp.encoding = "utf-8"
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError:
+        print("[HTTP {}] detail -> skip {}".format(resp.status_code, url))
+        return "", None
 
-    def fetch_post_detail(self, url: str) -> str:
-        self.delay()
-
-        # 재시도 로직 추가
-        max_retries = 2  # 본문은 2번만 재시도
-        for attempt in range(max_retries):
-            try:
-                res = requests.get(url, timeout=30)  # 타임아웃 30초로 증가
-                res.encoding = 'utf-8'
-                res.raise_for_status()
-                soup = BeautifulSoup(res.text, "html.parser")
-                detail_div = soup.find("div", class_="board_viewDetail")
-                return detail_div.get_text(strip=True) if detail_div else ""
-            except requests.Timeout:
-                print(f"본문 가져오기 타임아웃: {url} (시도 {attempt + 1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    time.sleep(10)  # 재시도 전 10초 대기
-                    continue
-            except requests.RequestException as e:
-                print(f"Error fetching post detail from {url}: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(5)
-                    continue
-
-        print(f"본문 가져오기 실패: {url}")
-        return ""
-
-    def crawl_all(self) -> List[Dict]:
-        all_data = []
-        for page in range(1, self.max_pages + 1):
-            print(f"페이지 {page}/{self.max_pages} 크롤링 중...")
-            html = self.fetch_page(page)
-            parsed = self.parse_page(html)
-
-            # 본문 필드가 필요하면 순차 크롤링
-            if "본문" in self.fields:
-                for i, row in enumerate(parsed):
-                    print(f"  본문 {i + 1}/{len(parsed)} 가져오는 중...")
-                    link = row.get("링크", "")
-                    row["본문"] = self.fetch_post_detail(link) if link else ""
-
-            all_data.extend(parsed)
-            print(f"페이지 {page} 완료: {len(parsed)}개 데이터 수집")
-
-        return all_data
-
-    @staticmethod
-    def save_to_csv(data: List[Dict]):
-        # 수집된 데이터를 CSV 파일로 저장 (고정 파일명)
-        if not data:
-            print("저장할 데이터가 없습니다.")
-            return
-
-        filename = "cnu_board_data.csv"
-        with open(filename, mode='w', newline='', encoding='utf-8-sig') as file:
-            writer = csv.DictWriter(file, fieldnames=data[0].keys())
-            writer.writeheader()
-            writer.writerows(data)
-
-        print(f"{filename}에 저장되었습니다.")
+    soup = BeautifulSoup(resp.text, "html.parser")
+    detail = soup.select_one("div.board_viewDetail")
+    content = detail.get_text(" ", strip=True) if detail else ""
+    posted_at = None  # TODO: 필요 시 상단 info 영역에서 파싱
+    return content, posted_at
