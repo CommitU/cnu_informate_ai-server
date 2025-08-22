@@ -7,8 +7,12 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
-from db import get_conn, upsert_notice, insert_notice_category
-from classifier_stub import classify
+try:
+    from .db import get_conn, upsert_notice, insert_notice_category
+    from .text_classifier import classify, configure_classifier
+except ImportError:
+    from db import get_conn, upsert_notice, insert_notice_category
+    from text_classifier import classify, configure_classifier
 
 # ---------------------------------------------------------
 # 소스 정의
@@ -99,9 +103,20 @@ class BoardAdapter:
         if not res:
             return "", None
         soup = BeautifulSoup(res.text, "html.parser")
-        # 본문
+        # 본문 - 형식 보존 (줄바꿈, 띄어쓰기 유지)
         detail_div = soup.find("div", class_="board_viewDetail")
-        content = detail_div.get_text(" ", strip=True) if detail_div else ""
+        if detail_div:
+            # <br> 태그를 줄바꿈으로 변환
+            for br in detail_div.find_all("br"):
+                br.replace_with("\n")
+            # <p> 태그를 줄바꿈으로 변환
+            for p in detail_div.find_all("p"):
+                p.insert_before("\n")
+                p.insert_after("\n")
+            content = detail_div.get_text().strip()
+        else:
+            content = ""
+        
         # 게시일(YYYY-MM-DD) 추출 시도
         date_text = None
         info = soup.select_one(".board_view .top_info, .view_info, .board_view .viewtop, .board_view .info")
@@ -147,7 +162,18 @@ class RecruitAdapter:
             return "", None
         soup = BeautifulSoup(res.text, "html.parser")
         content_area = soup.select_one(".board_viewDetail, .view_con, .content, .bbs_view")
-        content = content_area.get_text(" ", strip=True) if content_area else ""
+        if content_area:
+            # <br> 태그를 줄바꿈으로 변환
+            for br in content_area.find_all("br"):
+                br.replace_with("\n")
+            # <p> 태그를 줄바꿈으로 변환
+            for p in content_area.find_all("p"):
+                p.insert_before("\n")
+                p.insert_after("\n")
+            content = content_area.get_text().strip()
+        else:
+            content = ""
+        
         # 게시일(YYYY-MM-DD) 추출 시도
         date_text = None
         info = soup.select_one(".board_view .top_info, .bbs_view .info, .view_info, .meta")
@@ -161,7 +187,20 @@ class RecruitAdapter:
 # ---------------------------------------------------------
 # 파이프라인
 # ---------------------------------------------------------
-def run(pages: int = 2):
+def run(pages: int = 5, confidence_threshold: float = 0.7, api_config: Dict = None):
+    """
+    크롤링 파이프라인 실행
+    
+    Args:
+        pages: 크롤링할 페이지 수
+        confidence_threshold: 분류 신뢰도 임계값 (기본값: 0.7)
+        api_config: API 백업 설정 (예: {'url': 'http://api.example.com/classify', 'headers': {...}})
+    """
+    # 분류기 설정
+    if api_config or confidence_threshold != 0.7:
+        configure_classifier(confidence_threshold=confidence_threshold, api_config=api_config)
+        print(f"[CONFIG] 분류기 설정 - 임계값: {confidence_threshold}, API: {'설정됨' if api_config else '미설정'}")
+    
     with get_conn() as conn:
         with conn.cursor() as cur:
             for src in SOURCES:
@@ -188,8 +227,8 @@ def run(pages: int = 2):
                     for title, url in parser(html):
                         delay()
                         content, posted_at = fetcher(url)
-                        if content == "" and posted_at is None:
-                            print(f"[SKIP] detail fetch failed {url}")
+                        if not content or content.strip() == "":
+                            print(f"[SKIP] no content {url}")
                             continue
 
                         nid = upsert_notice(
@@ -206,11 +245,30 @@ def run(pages: int = 2):
                         insert_notice_category(cur, nid, cat_id, conf, ver)
 
                         count_on_page += 1
-                        print(f"[OK] src={sid} p={page} notice={nid} {title[:40]}...")
+                        print(f"[OK] src={sid} p={page} notice={nid} cat={cat_id} conf={conf:.2f} ver={ver} {title[:40]}...")
 
                     print(f"[PAGE DONE] source={sid} page={page} items={count_on_page}")
 
                 print(f"[DONE] source={sid}:{sname}")
 
 if __name__ == "__main__":
-    run(pages=2)
+    import os
+    from dotenv import load_dotenv
+    
+    load_dotenv()
+    
+    # 환경변수에서 OpenAI API 설정 로드
+    api_config = None
+    if os.getenv('OPENAI_API_KEY'):
+        api_config = {
+            'api_key': os.getenv('OPENAI_API_KEY'),
+            'model': os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
+        }
+    
+    print("=== CNU 정보 크롤링 + AI 분류 시스템 테스트 ===")
+    print("페이지: 2개")
+    print(f"분류 시스템: 키워드 + {'OpenAI API 백업' if api_config else '로컬 분류만'}")
+    print("신뢰도 임계값: 0.6")
+    print("=" * 50)
+    
+    run(pages=2, confidence_threshold=0.6, api_config=api_config)
