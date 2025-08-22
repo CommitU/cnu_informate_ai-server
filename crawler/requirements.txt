@@ -2,3 +2,6 @@ requests
 beautifulsoup4
 pymysql
 python-dotenv
+scikit-learn
+numpy
+openai
