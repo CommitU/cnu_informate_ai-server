@@ -1,8 +1,8 @@
-# CNU Infomate AI 서버 프로젝트 기능 정리
+# CNU Informate AI 서버 프로젝트 기능 정리
 
 ## 📋 프로젝트 개요
 
-**CNU Infomate**는 충남대학교 학사/모집 공지를 자동으로 크롤링하고, AI를 통해 카테고리별로 분류하여 데이터베이스에 저장하는 파이프라인 시스템입니다.
+**CNU Informate**는 충남대학교 학사/모집 공지를 자동으로 크롤링하고, AI를 통해 카테고리별로 분류하여 데이터베이스에 저장하는 파이프라인 시스템입니다.
 
 ### 🎯 주요 목적
 
@@ -18,7 +18,7 @@
 ### 전체 구조
 
 ```
-CNU Infomate AI Server
+CNU Informate AI Server
 ├── 크롤링 모듈 (crawler/)
 ├── AI 분류 시스템 (text_classifier.py)
 ├── 데이터베이스 관리 (db.py)
